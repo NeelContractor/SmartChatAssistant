@@ -242,6 +242,4 @@ get_stock_price(symbol)
 
 ## Future Improvements
 
-* Persist vector DB (Chroma / Pinecone)
-* Support multiple PDFs per thread
-* Better tool selection routing
+* Fix Delete logic

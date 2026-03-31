@@ -17,7 +17,7 @@ from backend import (
 
 st.set_page_config(
     page_title="SmartChat Assistant",
-    # page_icon="💬",
+    page_icon="🤖",
     layout="wide",
 )
 

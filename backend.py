@@ -13,11 +13,13 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langgraph.checkpoint.sqlite import SqliteSaver
+# from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 import requests
+import psycopg
 
 load_dotenv()
 
@@ -130,9 +132,10 @@ def get_stock_price(symbol: str) -> dict:
     Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')
     using Alpha Vantage.
     """
+    api_key = os.getenv("API_KEY")
     url = (
         "https://www.alphavantage.co/query"
-        f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={API_KEY}"
+        f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
     )
     r = requests.get(url)
     return r.json()
@@ -284,8 +287,16 @@ def dynamic_tool_node(state: ChatState, config=None):
 # Checkpointer
 # ---------------------------------------------------------------------------
 
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
-checkpointer = SqliteSaver(conn=conn)
+# conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
+# checkpointer = SqliteSaver(conn=conn)
+
+# checkpointer = PostgresSaver.from_conn_string(os.getenv("NEON_DB_URL"))
+db_url = os.getenv("NEON_DB_URL")
+
+checkpointer_conn = psycopg.connect(db_url, autocommit=True, prepare_threshold=0)
+checkpointer = PostgresSaver(checkpointer_conn)
+
+checkpointer.setup()
 
 # ---------------------------------------------------------------------------
 # Graph

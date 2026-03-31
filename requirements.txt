@@ -9,3 +9,5 @@ langgraph-checkpoint-sqlite
 ddgs
 pypdf
 faiss-cpu
+langgraph-checkpoint-postgres
+psycopg[binary]
