@@ -101,7 +101,7 @@ Stream to UI
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```
 .
@@ -114,7 +114,7 @@ Stream to UI
 
 ---
 
-## ⚙️ Setup Instructions
+## Setup Instructions
 
 ### 1. Clone the Repo
 
