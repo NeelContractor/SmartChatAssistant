@@ -279,6 +279,26 @@ def add_thread(thread_id):
     if thread_id not in st.session_state["chat_threads"]:
         st.session_state["chat_threads"].append(thread_id)
 
+def delete_thread(thread_id):
+    tid = str(thread_id)
+
+    # 1. Remove from in-memory session state
+    st.session_state["chat_threads"] = [
+        t for t in st.session_state["chat_threads"] if str(t) != tid
+    ]
+    st.session_state["ingested_docs"].pop(tid, None)
+
+    # 2. Permanently delete from Postgres
+    try:
+        from backend import delete_thread_from_db
+        delete_thread_from_db(tid)
+    except Exception as e:
+        st.error(f"Failed to delete from DB: {e}")
+
+    # 3. If the deleted thread was active, start a fresh chat
+    if str(st.session_state["thread_id"]) == tid:
+        reset_chat()
+
 
 def load_conversation(thread_id):
     state = chatbot.get_state(config={"configurable": {"thread_id": str(thread_id)}})
@@ -296,45 +316,6 @@ def get_conversation_preview(thread_id):
     except Exception:
         pass
     return "Empty conversation"
-
-
-def delete_thread(thread_id):
-    """
-    Remove thread from sidebar and purge its checkpoints from the DB.
-
-    Uses checkpointer.delete_thread() (the official LangGraph API) which
-    deletes from both the `checkpoints` and `writes` tables correctly.
-    Falls back to direct SQL only if the method is unavailable (older versions).
-    """
-    tid = str(thread_id)
-
-    # 1. Remove from in-memory session state
-    st.session_state["chat_threads"] = [
-        t for t in st.session_state["chat_threads"] if str(t) != tid
-    ]
-    st.session_state["ingested_docs"].pop(tid, None)
-
-    # 2. Purge from the SQLite checkpoint store
-    try:
-        # Preferred: use the official API (LangGraph ≥ 0.2)
-        config = {"configurable": {"thread_id": tid}}
-        checkpointer.delete_thread(config)
-    except (AttributeError, TypeError):
-        # Fallback for older LangGraph versions — correct table names are
-        # `checkpoints` and `writes` (NOT `checkpoint_writes`)
-        try:
-            from backend import conn as db_conn
-            cur = db_conn.cursor()
-            cur.execute("DELETE FROM checkpoints WHERE thread_id = ?", (tid,))
-            cur.execute("DELETE FROM writes WHERE thread_id = ?", (tid,))
-            db_conn.commit()
-        except Exception:
-            pass
-
-    # 3. If the deleted thread was active, start a fresh chat
-    if str(st.session_state["thread_id"]) == tid:
-        reset_chat()
-
 
 # ---------------------------------------------------------------------------
 # Session Initialization

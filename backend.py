@@ -13,11 +13,13 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama, OllamaEmbeddings
-# from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from duckduckgo_search import DDGS
+from langchain_core.tools import tool as lc_tool
+from tavily import TavilyClient
 import requests
 import psycopg
 
@@ -25,9 +27,6 @@ load_dotenv()
 
 # ---------------------------------------------------------------------------
 # LLM + Embeddings
-# Use qwen3:4b or higher — 0.6b is too small to reliably call tools.
-# Change this to any model you have pulled in Ollama, e.g.:
-#   "qwen3:4b", "llama3.2:3b", "mistral:7b", "phi3:mini"
 # ---------------------------------------------------------------------------
 LLM_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:0.6b")
 
@@ -93,7 +92,37 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
 # Static tools
 # ---------------------------------------------------------------------------
 
-search_tool = DuckDuckGoSearchRun(region="us-en")
+@lc_tool
+def search_tool(query: str) -> str:
+    """
+    Search the web for current information. Use this for any question about
+    recent events, news, prices, people, weather, or anything needing up-to-date info.
+    Always call this tool when the user asks about current or recent information.
+    """
+    try:
+        client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+        response = client.search(
+            query=query,
+            search_depth="basic",
+            max_results=5,
+            include_answer=True,   
+        )
+
+        # Direct answer if available
+        output = []
+        if response.get("answer"):
+            output.append(f"**Summary:** {response['answer']}\n")
+
+        for r in response.get("results", []):
+            title = r.get("title", "No title")
+            content = r.get("content", "No summary")
+            url = r.get("url", "")
+            output.append(f"**{title}**\n{content}\nSource: {url}")
+
+        return "\n\n---\n\n".join(output) if output else f"No results found for: {query}"
+
+    except Exception as e:
+        return f"Search error: {type(e).__name__}: {e}"
 
 
 @tool
@@ -254,11 +283,21 @@ def chat_node(state: ChatState, config=None):
     )
 
     system_content = (
-        "You are SmartChat Assistant, a helpful AI.\n"
+        "You are SmartChat Assistant, a helpful AI with access to tools.\n"
+        "CRITICAL: Always respond in the same language the user wrote in. "
+        "If the user writes in English, respond in English only.\n"  # ADD THIS
+        "IMPORTANT TOOL USE RULES:\n"
+        "- If the user asks about current events, news, prices, sports, weather, "
+        "or ANYTHING that requires up-to-date information → you MUST call search_tool.\n"
+        "- If the user asks about math or calculations → call calculator.\n"
+        "- If the user asks about a stock → call get_stock_price.\n"
+        "- If a document is uploaded and the question relates to it → call rag_tool.\n"
+        "Never answer from memory when a tool would give a better answer. "
+        "If a tool returns no results or an error, report that honestly — do NOT make up an answer.\n\n"
         f"{doc_instruction}\n"
-        "You can also use web search, stock price lookup, and calculator tools.\n"
         f"{rag_context}"
     )
+
 
     system_message = SystemMessage(content=system_content)
 
@@ -287,10 +326,6 @@ def dynamic_tool_node(state: ChatState, config=None):
 # Checkpointer
 # ---------------------------------------------------------------------------
 
-# conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
-# checkpointer = SqliteSaver(conn=conn)
-
-# checkpointer = PostgresSaver.from_conn_string(os.getenv("NEON_DB_URL"))
 db_url = os.getenv("NEON_DB_URL")
 
 checkpointer_conn = psycopg.connect(db_url, autocommit=True, prepare_threshold=0)
@@ -330,3 +365,12 @@ def thread_has_document(thread_id: str) -> bool:
 
 def thread_docuemnt_metadata(thread_id: str) -> dict:
     return _THREAD_METADATA.get(str(thread_id), {})
+
+def delete_thread_from_db(thread_id: str) -> None:
+    """Permanently delete all checkpoint data for a thread from Postgres."""
+    tid = str(thread_id)
+    with checkpointer_conn.cursor() as cur:
+        cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (tid,))
+        cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (tid,))
+        cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (tid,))
+    # autocommit=True so no explicit commit needed
