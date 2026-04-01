@@ -4,3 +4,4 @@ chatbot.db-shm
 chatbot.db-wal
 chatbot.db
 venv
+.DS_Store
