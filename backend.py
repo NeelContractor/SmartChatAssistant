@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 import os
-import sqlite3
+import re
 import tempfile
 from typing import Annotated, Any, Dict, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.vectorstores import FAISS
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from duckduckgo_search import DDGS
 from langchain_core.tools import tool as lc_tool
 from tavily import TavilyClient
 import requests
@@ -28,7 +26,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # LLM + Embeddings
 # ---------------------------------------------------------------------------
-LLM_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:0.6b")
+LLM_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 
 llm = ChatOllama(model=LLM_MODEL, base_url="http://localhost:11434")
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
@@ -97,7 +95,6 @@ def search_tool(query: str) -> str:
     """
     Search the web for current information. Use this for any question about
     recent events, news, prices, people, weather, or anything needing up-to-date info.
-    Always call this tool when the user asks about current or recent information.
     """
     try:
         client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
@@ -105,10 +102,9 @@ def search_tool(query: str) -> str:
             query=query,
             search_depth="basic",
             max_results=5,
-            include_answer=True,   
+            include_answer=True,
         )
 
-        # Direct answer if available
         output = []
         if response.get("answer"):
             output.append(f"**Summary:** {response['answer']}\n")
@@ -172,7 +168,6 @@ def get_stock_price(symbol: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Dynamic RAG tool factory
-# thread_id baked into a closure — LLM only needs to call rag_tool(query).
 # ---------------------------------------------------------------------------
 
 def make_rag_tool(thread_id: str):
@@ -204,18 +199,9 @@ static_tools = [search_tool, get_stock_price, calculator]
 
 # ---------------------------------------------------------------------------
 # Forced RAG context injection
-#
-# Small models often skip tool calls entirely. As a safety net, if a document
-# is indexed for the current thread we retrieve relevant chunks BEFORE the LLM
-# sees the user message, and inject them directly into the system prompt.
-# This means the model gets the document context whether it calls the tool or not.
 # ---------------------------------------------------------------------------
 
 def _inject_rag_context(user_query: str, thread_id: str) -> str:
-    """
-    Retrieve top-k chunks for the query and return them as a formatted string.
-    Returns an empty string if no retriever is registered for this thread.
-    """
     retriever = _get_retriever(thread_id)
     if retriever is None:
         return ""
@@ -238,6 +224,88 @@ def _inject_rag_context(user_query: str, thread_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Intent classifier  (Layer 1)
+#
+# Detects greetings/small talk BEFORE calling the LLM so we can unbind tools.
+# Uses fuzzy matching to handle common typos like "hye", "helo", "thansk".
+# ---------------------------------------------------------------------------
+
+# Canonical conversational tokens — we'll fuzzy-match against these
+_CONVERSATIONAL_TOKENS = [
+    "hey", "hi", "hello", "howdy", "hiya", "greetings", "sup", "yo",
+    "thanks", "thank you", "ty", "thx", "cheers", "np", "no problem",
+    "okay", "ok", "sure", "cool", "great", "nice", "awesome", "got it", "alright",
+    "bye", "goodbye", "see you", "later", "cya",
+]
+
+# Exact multi-word conversational phrases
+_CONVERSATIONAL_PHRASES = re.compile(
+    r"^\s*("
+    r"what'?s up|how are you|how r u|how are u|how'?s it going|how do you do|"
+    r"good morning|good afternoon|good evening|good night|"
+    r"what('?s| is) your name|who are you|what are you|"
+    r"are you (an? )?ai|are you (an? )?bot|are you (an? )?robot|"
+    r"whats up|watsup|wassup"
+    r")\s*[!?.]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _fuzzy_match_token(word: str, target: str, max_distance: int = 1) -> bool:
+    """Simple Levenshtein-distance check for short words (handles typos)."""
+    if abs(len(word) - len(target)) > max_distance:
+        return False
+    if word == target:
+        return True
+    # Count character edits (insertions / deletions / substitutions)
+    prev = list(range(len(target) + 1))
+    for i, cw in enumerate(word):
+        curr = [i + 1]
+        for j, ct in enumerate(target):
+            curr.append(min(prev[j] + (0 if cw == ct else 1),
+                            curr[j] + 1,
+                            prev[j + 1] + 1))
+        prev = curr
+    return prev[-1] <= max_distance
+
+
+def _is_conversational(text: str) -> bool:
+    """
+    Return True if the message is pure small talk — no tools needed.
+    Handles typos (hye → hey, thansk → thanks) via fuzzy matching.
+    """
+    text = text.strip().rstrip("!?.")
+
+    # Check multi-word phrases first
+    if _CONVERSATIONAL_PHRASES.match(text + " "):  # add space so $ anchors correctly
+        return True
+
+    # Split into words and check if ALL words fuzzy-match conversational tokens
+    words = text.lower().split()
+    if not words or len(words) > 4:  # long messages are never just small talk
+        return False
+
+    for word in words:
+        matched = any(_fuzzy_match_token(word, token.split()[0]) for token in _CONVERSATIONAL_TOKENS)
+        if not matched:
+            return False
+    return True
+
+
+def _strip_tool_calls(response: AIMessage) -> AIMessage:
+    """
+    Layer 2 safety net: if the model somehow still emitted tool_calls
+    on a conversational message, strip them out so the graph doesn't
+    route to the tool node.
+    """
+    if not getattr(response, "tool_calls", None):
+        return response
+    # Return a clean AIMessage with only the text content
+    clean_content = response.content if isinstance(response.content, str) else ""
+    return AIMessage(content=clean_content or "Hey there! How can I help you?")
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -250,18 +318,10 @@ class ChatState(TypedDict):
 # ---------------------------------------------------------------------------
 
 def chat_node(state: ChatState, config=None):
-    """
-    LLM node.
-    1. Retrieves RAG context directly and injects it into the system prompt
-       (fallback for small models that skip tool calls).
-    2. Also binds the rag_tool so capable models can call it explicitly.
-    """
     thread_id = ""
     if config and isinstance(config, dict):
         thread_id = config.get("configurable", {}).get("thread_id", "")
 
-    # --- Forced RAG: pull context from the retriever right now ---
-    # Find the latest human message to use as the retrieval query
     user_query = ""
     for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage) and msg.content:
@@ -284,35 +344,43 @@ def chat_node(state: ChatState, config=None):
 
     system_content = (
         "You are SmartChat Assistant, a helpful AI with access to tools.\n"
-        "CRITICAL: Always respond in the same language the user wrote in. "
-        "If the user writes in English, respond in English only.\n"  # ADD THIS
-        "IMPORTANT TOOL USE RULES:\n"
-        "- If the user asks about current events, news, prices, sports, weather, "
-        "or ANYTHING that requires up-to-date information → you MUST call search_tool.\n"
-        "- If the user asks about math or calculations → call calculator.\n"
-        "- If the user asks about a stock → call get_stock_price.\n"
-        "- If a document is uploaded and the question relates to it → call rag_tool.\n"
-        "Never answer from memory when a tool would give a better answer. "
-        "If a tool returns no results or an error, report that honestly — do NOT make up an answer.\n\n"
+        "CRITICAL: Always respond in the same language the user wrote in.\n\n"
+        "TOOL USE RULES:\n"
+        "- Only call search_tool when the user explicitly asks about a specific "
+        "topic, event, person, news, price, or fact that requires current data.\n"
+        "- Only call calculator when the user asks you to compute a math expression.\n"
+        "- Only call get_stock_price when the user asks about a specific stock ticker.\n"
+        "- Only call rag_tool when the user asks about the uploaded document.\n\n"
+        "RESPONSE RULES:\n"
+        "- Report tool results clearly and directly.\n"
+        "- NEVER fabricate error messages. If a tool succeeded, present its output.\n\n"
         f"{doc_instruction}\n"
         f"{rag_context}"
     )
 
-
     system_message = SystemMessage(content=system_content)
 
-    # Build tools — bind rag_tool even for small models as a best-effort
-    rag_tool_for_thread = make_rag_tool(thread_id)
-    current_tools = [*static_tools, rag_tool_for_thread]
-    current_llm = llm.bind_tools(current_tools)
+    conversational = _is_conversational(user_query)
+
+    if conversational:
+        # Layer 1: don't bind tools at all — model physically cannot call them
+        current_llm = llm
+    else:
+        rag_tool_for_thread = make_rag_tool(thread_id)
+        current_tools = [*static_tools, rag_tool_for_thread]
+        current_llm = llm.bind_tools(current_tools)
 
     messages = [system_message, *state["messages"]]
     response = current_llm.invoke(messages, config=config)
+
+    if conversational:
+        # Layer 2: strip any tool_calls the model hallucinated anyway
+        response = _strip_tool_calls(response)
+
     return {"messages": [response]}
 
 
 def dynamic_tool_node(state: ChatState, config=None):
-    """Tool executor — uses the thread-specific rag_tool."""
     thread_id = ""
     if config and isinstance(config, dict):
         thread_id = config.get("configurable", {}).get("thread_id", "")
@@ -352,10 +420,13 @@ chatbot = graph.compile(checkpointer=checkpointer)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def retrieve_all_threads() -> list:
+def retrieve_all_threads(user_id: str) -> list:
+    """Return only threads that belong to the given user."""
     all_threads = set()
     for checkpoint in checkpointer.list(None):
-        all_threads.add(checkpoint.config["configurable"]["thread_id"])
+        meta = checkpoint.metadata or {}
+        if meta.get("user_id") == user_id:
+            all_threads.add(checkpoint.config["configurable"]["thread_id"])
     return list(all_threads)
 
 
@@ -366,6 +437,7 @@ def thread_has_document(thread_id: str) -> bool:
 def thread_docuemnt_metadata(thread_id: str) -> dict:
     return _THREAD_METADATA.get(str(thread_id), {})
 
+
 def delete_thread_from_db(thread_id: str) -> None:
     """Permanently delete all checkpoint data for a thread from Postgres."""
     tid = str(thread_id)
@@ -373,4 +445,3 @@ def delete_thread_from_db(thread_id: str) -> None:
         cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (tid,))
         cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (tid,))
         cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (tid,))
-    # autocommit=True so no explicit commit needed

@@ -260,6 +260,23 @@ hr { border-color: #1f2937 !important; }
 
 
 # ---------------------------------------------------------------------------
+# User Identity
+# Persists a user ID in the URL query params (?uid=...) so it survives
+# page refreshes. Each browser/tab gets its own stable identity.
+# ---------------------------------------------------------------------------
+
+def get_or_create_user_id() -> str:
+    params = st.query_params
+    if "uid" in params:
+        return params["uid"]
+    new_uid = str(uuid.uuid4())
+    st.query_params["uid"] = new_uid
+    return new_uid
+
+USER_ID = get_or_create_user_id()
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -278,6 +295,7 @@ def reset_chat():
 def add_thread(thread_id):
     if thread_id not in st.session_state["chat_threads"]:
         st.session_state["chat_threads"].append(thread_id)
+
 
 def delete_thread(thread_id):
     tid = str(thread_id)
@@ -317,6 +335,7 @@ def get_conversation_preview(thread_id):
         pass
     return "Empty conversation"
 
+
 # ---------------------------------------------------------------------------
 # Session Initialization
 # ---------------------------------------------------------------------------
@@ -328,7 +347,8 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = retrieve_all_threads()
+    # Only load threads that belong to this user
+    st.session_state["chat_threads"] = retrieve_all_threads(USER_ID)
 
 if "ingested_docs" not in st.session_state:
     st.session_state["ingested_docs"] = {}
@@ -411,7 +431,6 @@ with st.sidebar:
             short_id = tid_str[:8] + "…"
             card_cls = "conv-card active" if is_active else "conv-card"
 
-            # Card (preview text) — full width, no columns
             st.markdown(
                 f"""<div class="{card_cls}">
                     <div class="conv-card-id">{short_id}</div>
@@ -420,15 +439,12 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
 
-            # Action buttons below the card
             if is_active:
-                # Active thread — only a delete button, full width
                 st.markdown('<div class="conv-del-only">', unsafe_allow_html=True)
                 if st.button("✕ Delete", key=f"del-{tid_str}", use_container_width=True):
                     st.session_state["confirm_delete"] = tid_str
                 st.markdown("</div>", unsafe_allow_html=True)
             else:
-                # Inactive thread — Open (wider) + Delete (narrower) side by side
                 col_open, col_del = st.columns([3, 1])
                 with col_open:
                     st.markdown('<div class="conv-open-btn">', unsafe_allow_html=True)
@@ -441,7 +457,6 @@ with st.sidebar:
                         st.session_state["confirm_delete"] = tid_str
                     st.markdown("</div>", unsafe_allow_html=True)
 
-            # Add a small spacer between entries
             st.markdown("<div style='margin-bottom:6px'></div>", unsafe_allow_html=True)
 
         # Confirmation prompt
@@ -500,7 +515,11 @@ if user_input:
 
     CONFIG = {
         "configurable": {"thread_id": thread_key},
-        "metadata": {"thread_id": thread_key},
+        # user_id is stored in metadata so retrieve_all_threads() can filter by it
+        "metadata": {
+            "thread_id": thread_key,
+            "user_id": USER_ID,
+        },
         "run_name": "chat_turn",
     }
 
