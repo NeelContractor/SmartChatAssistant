@@ -11,12 +11,14 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+# from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool as lc_tool
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 from tavily import TavilyClient
 import requests
 import psycopg
@@ -26,10 +28,20 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # LLM + Embeddings
 # ---------------------------------------------------------------------------
-LLM_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+# LLM_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+LLM_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-llm = ChatOllama(model=LLM_MODEL, base_url="http://localhost:11434")
-embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+# llm = ChatOllama(model=LLM_MODEL, base_url="http://localhost:11434")
+llm = ChatGroq(
+    model=LLM_MODEL,
+    api_key=os.getenv("GROQ_API_KEY"),
+    temperature=0.7,
+)
+# embeddings = OllamaEmbeddings(model="nomic-embed-text")
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # ---------------------------------------------------------------------------
 # PDF retriever store (per thread)
@@ -122,7 +134,7 @@ def search_tool(query: str) -> str:
 
 
 @tool
-def calculator(first_num: float, second_num: float, operation: str) -> dict:
+def calculator(first_num: float, second_num: float, operation: str) -> str:
     """
     Perform a basic arithmetic operation on two numbers.
     Supported operations: add, sub, mul, div
@@ -136,23 +148,17 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
             result = first_num * second_num
         elif operation == "div":
             if second_num == 0:
-                return {"error": "Division by zero is not allowed"}
+                return "Error: division by zero is not allowed."
             result = first_num / second_num
         else:
-            return {"error": f"Unsupported operation '{operation}'"}
-
-        return {
-            "first_num": first_num,
-            "second_num": second_num,
-            "operation": operation,
-            "result": result,
-        }
+            return f"Error: unsupported operation '{operation}'. Use add, sub, mul, or div."
+        return f"{first_num} {operation} {second_num} = {result}"
     except Exception as e:
-        return {"error": str(e)}
+        return f"Calculator error: {e}"
 
 
 @tool
-def get_stock_price(symbol: str) -> dict:
+def get_stock_price(symbol: str) -> str:
     """
     Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')
     using Alpha Vantage.
@@ -162,8 +168,21 @@ def get_stock_price(symbol: str) -> dict:
         "https://www.alphavantage.co/query"
         f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
     )
-    r = requests.get(url)
-    return r.json()
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        quote = data.get("Global Quote", {})
+        if not quote:
+            return f"No data found for symbol '{symbol}'. Check the ticker or API key."
+        return (
+            f"Stock: {quote.get('01. symbol')}\n"
+            f"Price: ${quote.get('05. price')}\n"
+            f"Change: {quote.get('09. change')} ({quote.get('10. change percent')})\n"
+            f"Volume: {quote.get('06. volume')}\n"
+            f"Last trading day: {quote.get('07. latest trading day')}"
+        )
+    except Exception as e:
+        return f"Error fetching stock price: {e}"
 
 
 # ---------------------------------------------------------------------------

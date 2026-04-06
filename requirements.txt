@@ -13,3 +13,7 @@ langgraph-checkpoint-postgres
 psycopg[binary]
 duckduckgo_search
 tavily-python
+langchain-text-splitters
+langchain-huggingface
+langchain_groq
+sentence-transformers
